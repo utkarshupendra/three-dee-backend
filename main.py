@@ -1,14 +1,18 @@
 import os
 import asyncio
 import tempfile
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, APIRouter
-from typing import List, Optional
+import uuid
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, APIRouter, BackgroundTasks
+from typing import List, Optional, Dict, Any
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from tripo3d import TripoClient, TaskStatus
 import database as db
+
+# In-memory store for pending tasks (maps our job_id to tripo task_id and metadata)
+pending_jobs: Dict[str, Dict[str, Any]] = {}
 
 load_dotenv()
 
@@ -138,15 +142,102 @@ class ModelUpdate(BaseModel):
     description: Optional[str] = None
 
 
+async def process_conversion_job(job_id: str, images: List[str], name: Optional[str], view_config: dict):
+    """Background task to process the conversion."""
+    try:
+        pending_jobs[job_id]["status"] = "processing"
+        pending_jobs[job_id]["progress"] = 10
+        pending_jobs[job_id]["message"] = "Uploading images to Tripo3D..."
+        
+        async with TripoClient(api_key=TRIPO_API_KEY) as client:
+            # Submit to Tripo
+            if len(images) == 1:
+                tripo_task_id = await client.image_to_model(image=images[0])
+            else:
+                tripo_task_id = await client.multiview_to_model(images=images)
+            
+            pending_jobs[job_id]["tripo_task_id"] = tripo_task_id
+            pending_jobs[job_id]["progress"] = 20
+            pending_jobs[job_id]["message"] = "Task submitted, generating 3D model..."
+            print(f"Job {job_id}: Tripo task created: {tripo_task_id}")
+            
+            # Poll for completion
+            while True:
+                task = await client.get_task(tripo_task_id)
+                
+                if task.status == TaskStatus.SUCCESS:
+                    model_url = None
+                    thumbnail_url = None
+                    if task.output:
+                        model_url = task.output.pbr_model or task.output.model or task.output.base_model
+                        thumbnail_url = task.output.rendered_image
+                    
+                    # Save to database
+                    model_id = db.save_model(
+                        task_id=tripo_task_id,
+                        model_url=model_url,
+                        name=name,
+                        thumbnail_url=thumbnail_url,
+                        view_config=view_config
+                    )
+                    
+                    pending_jobs[job_id]["status"] = "completed"
+                    pending_jobs[job_id]["progress"] = 100
+                    pending_jobs[job_id]["message"] = "Model generation complete!"
+                    pending_jobs[job_id]["result"] = {
+                        "model_id": model_id,
+                        "model_url": model_url,
+                        "thumbnail_url": thumbnail_url,
+                        "view_config": view_config
+                    }
+                    print(f"Job {job_id}: Completed successfully")
+                    break
+                    
+                elif task.status == TaskStatus.FAILED:
+                    pending_jobs[job_id]["status"] = "failed"
+                    pending_jobs[job_id]["progress"] = 0
+                    pending_jobs[job_id]["message"] = "Model generation failed"
+                    pending_jobs[job_id]["error"] = str(task.status)
+                    print(f"Job {job_id}: Failed")
+                    break
+                    
+                else:
+                    # Still processing - update progress based on status
+                    progress = pending_jobs[job_id].get("progress", 20)
+                    if progress < 90:
+                        pending_jobs[job_id]["progress"] = min(progress + 5, 90)
+                    
+                    status_msg = str(task.status).replace("TaskStatus.", "")
+                    pending_jobs[job_id]["message"] = f"Processing: {status_msg}"
+                    
+                await asyncio.sleep(3)  # Poll every 3 seconds
+                
+    except Exception as e:
+        pending_jobs[job_id]["status"] = "failed"
+        pending_jobs[job_id]["progress"] = 0
+        pending_jobs[job_id]["message"] = f"Error: {str(e)}"
+        pending_jobs[job_id]["error"] = str(e)
+        print(f"Job {job_id}: Error - {e}")
+    
+    finally:
+        # Clean up temp files
+        for img_path in images:
+            try:
+                os.unlink(img_path)
+            except:
+                pass
+
+
 @api_router.post("/convert-multiview")
 async def convert_multiview(
+    background_tasks: BackgroundTasks,
     front: Optional[UploadFile] = File(None),
     back: Optional[UploadFile] = File(None),
     left: Optional[UploadFile] = File(None),
     right: Optional[UploadFile] = File(None),
     name: Optional[str] = Form(None)
 ):
-    """Convert images to 3D model with specific view positions."""
+    """Submit images for async 3D model conversion. Returns job_id for polling."""
     
     if not TRIPO_API_KEY:
         raise HTTPException(status_code=500, detail="TRIPO_API_KEY not configured")
@@ -154,8 +245,8 @@ async def convert_multiview(
     if not front:
         raise HTTPException(status_code=400, detail="Front view image is required")
     
-    temp_files = []
     view_config = {}
+    images = []
     
     async def save_upload(upload: UploadFile, view_name: str) -> str:
         contents = await upload.read()
@@ -168,68 +259,58 @@ async def convert_multiview(
         view_config[view_name] = upload.filename
         return temp_file.name
     
-    try:
-        # Build images list in order: front, back, left, right
-        images = []
-        
-        # Front is required
-        images.append(await save_upload(front, "front"))
-        temp_files.append(images[-1])
-        
-        # Optional views
-        if back:
-            images.append(await save_upload(back, "back"))
-            temp_files.append(images[-1])
-        if left:
-            images.append(await save_upload(left, "left"))
-            temp_files.append(images[-1])
-        if right:
-            images.append(await save_upload(right, "right"))
-            temp_files.append(images[-1])
-        
-        async with TripoClient(api_key=TRIPO_API_KEY) as client:
-            if len(images) == 1:
-                task_id = await client.image_to_model(image=images[0])
-            else:
-                task_id = await client.multiview_to_model(images=images)
-            
-            print(f"Task created: {task_id}")
-            task = await client.wait_for_task(task_id, verbose=True)
-            
-            if task.status == TaskStatus.SUCCESS:
-                model_url = None
-                thumbnail_url = None
-                if task.output:
-                    model_url = task.output.pbr_model or task.output.model or task.output.base_model
-                    thumbnail_url = task.output.rendered_image
-                
-                # Save to database
-                model_id = db.save_model(
-                    task_id=task_id,
-                    model_url=model_url,
-                    name=name,
-                    thumbnail_url=thumbnail_url,
-                    view_config=view_config
-                )
-                
-                return JSONResponse({
-                    "status": "success",
-                    "task_id": task_id,
-                    "model_id": model_id,
-                    "model_url": model_url,
-                    "thumbnail_url": thumbnail_url,
-                    "view_config": view_config
-                })
-            else:
-                print(f"Task failed: {task}")
-                raise HTTPException(status_code=500, detail=f"Task failed: {task.status}")
+    # Save all uploads
+    images.append(await save_upload(front, "front"))
+    if back:
+        images.append(await save_upload(back, "back"))
+    if left:
+        images.append(await save_upload(left, "left"))
+    if right:
+        images.append(await save_upload(right, "right"))
     
-    finally:
-        for temp_file in temp_files:
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
+    # Create job
+    job_id = str(uuid.uuid4())
+    pending_jobs[job_id] = {
+        "status": "queued",
+        "progress": 0,
+        "message": "Job queued, starting...",
+        "name": name,
+        "view_count": len(images)
+    }
+    
+    # Start background processing
+    background_tasks.add_task(process_conversion_job, job_id, images, name, view_config)
+    
+    return JSONResponse({
+        "job_id": job_id,
+        "status": "queued",
+        "message": "Conversion job started"
+    })
+
+
+@api_router.get("/job/{job_id}")
+async def get_job_status(job_id: str):
+    """Get the status of a conversion job for polling."""
+    if job_id not in pending_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job = pending_jobs[job_id]
+    response = {
+        "job_id": job_id,
+        "status": job.get("status", "unknown"),
+        "progress": job.get("progress", 0),
+        "message": job.get("message", ""),
+    }
+    
+    # Include result if completed
+    if job.get("status") == "completed" and "result" in job:
+        response["result"] = job["result"]
+    
+    # Include error if failed
+    if job.get("status") == "failed" and "error" in job:
+        response["error"] = job["error"]
+    
+    return response
 
 
 @api_router.get("/models")
