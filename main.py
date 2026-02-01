@@ -15,14 +15,9 @@ load_dotenv()
 app = FastAPI(title="2D to 3D Converter")
 api_router = APIRouter(prefix="/api")
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
-allowed_origins = [FRONTEND_URL, "http://localhost:5173", "http://localhost:3000"]
-if FRONTEND_URL and FRONTEND_URL not in allowed_origins:
-    allowed_origins.append(FRONTEND_URL)
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
