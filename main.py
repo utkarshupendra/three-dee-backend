@@ -1,7 +1,7 @@
 import os
 import asyncio
 import tempfile
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, APIRouter
 from typing import List, Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -13,6 +13,7 @@ import database as db
 load_dotenv()
 
 app = FastAPI(title="2D to 3D Converter")
+api_router = APIRouter(prefix="/api")
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 allowed_origins = [FRONTEND_URL, "http://localhost:5173", "http://localhost:3000"]
@@ -35,7 +36,7 @@ async def root():
     return {"message": "2D to 3D Converter API", "status": "running"}
 
 
-@app.post("/upload-and-convert")
+@api_router.post("/upload-and-convert")
 async def upload_and_convert(files: List[UploadFile] = File(...)):
     """Upload images and convert to 3D model using Tripo3D SDK."""
     
@@ -104,7 +105,7 @@ async def upload_and_convert(files: List[UploadFile] = File(...)):
                 pass
 
 
-@app.get("/proxy-glb")
+@api_router.get("/proxy-glb")
 async def proxy_glb(url: str):
     """Proxy GLB file to avoid CORS issues"""
     import httpx
@@ -121,7 +122,7 @@ async def proxy_glb(url: str):
         )
 
 
-@app.get("/task/{task_id}")
+@api_router.get("/task/{task_id}")
 async def get_task_status(task_id: str):
     """Get the status of a conversion task"""
     
@@ -142,7 +143,7 @@ class ModelUpdate(BaseModel):
     description: Optional[str] = None
 
 
-@app.post("/convert-multiview")
+@api_router.post("/convert-multiview")
 async def convert_multiview(
     front: Optional[UploadFile] = File(None),
     back: Optional[UploadFile] = File(None),
@@ -236,14 +237,14 @@ async def convert_multiview(
                 pass
 
 
-@app.get("/models")
+@api_router.get("/models")
 async def get_models():
     """Get all saved models."""
     models = db.get_all_models()
     return {"models": models}
 
 
-@app.get("/models/{model_id}")
+@api_router.get("/models/{model_id}")
 async def get_model(model_id: int):
     """Get a specific model by ID."""
     model = db.get_model(model_id)
@@ -252,7 +253,7 @@ async def get_model(model_id: int):
     return model
 
 
-@app.put("/models/{model_id}")
+@api_router.put("/models/{model_id}")
 async def update_model(model_id: int, update: ModelUpdate):
     """Update model metadata."""
     success = db.update_model(model_id, name=update.name, description=update.description)
@@ -261,7 +262,7 @@ async def update_model(model_id: int, update: ModelUpdate):
     return {"status": "updated", "model_id": model_id}
 
 
-@app.delete("/models/{model_id}")
+@api_router.delete("/models/{model_id}")
 async def delete_model(model_id: int):
     """Delete a model."""
     success = db.delete_model(model_id)
@@ -269,6 +270,8 @@ async def delete_model(model_id: int):
         raise HTTPException(status_code=404, detail="Model not found")
     return {"status": "deleted", "model_id": model_id}
 
+
+app.include_router(api_router)
 
 if __name__ == "__main__":
     import uvicorn
